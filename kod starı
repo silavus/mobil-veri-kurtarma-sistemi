@@ -1,0 +1,830 @@
+import sys
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QLineEdit, QStackedWidget,
+                             QComboBox, QMessageBox, QTextEdit, QScrollArea,
+                             QFormLayout, QGroupBox, QFileDialog) # QFileDialog eklendi
+from PyQt5.QtGui import QIcon, QFont, QColor
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal # Threading için eklendi
+
+import os
+import subprocess # Harici komutları çalıştırmak için
+
+# --- Uygulama Ayarları ---
+APP_NAME = "Mobil Veri Asistanı"
+VERSION = "1.1" # Versiyonu güncelledik
+ADMIN_USER = "admin"
+ADMIN_PASS = "admin123" # Gerçek uygulamada güvenli şifreleme kullanılmalı!
+
+# Telefon Modelleri (Örnek veriler)
+PHONE_MODELS = {
+    "Samsung": ["Galaxy S23", "Galaxy A54", "Galaxy Fold 5", "Mevcut Cihazları Algıla"],
+    "Xiaomi": ["Redmi Note 12", "Xiaomi 13 Pro", "Mevcut Cihazları Algıla"],
+    "iPhone": ["iPhone 15", "iPhone 14 Pro", "Mevcut Cihazları Algıla"], # iOS için doğrudan işlemler kısıtlıdır!
+    "Huawei": ["P60 Pro", "Mate X3", "Mevcut Cihazları Algıla"]
+}
+
+# --- Arka Plan İşlemleri İçin Worker Sınıfı ---
+class Worker(QThread):
+    finished = pyqtSignal(str, int) # Log çıktısı ve dönüş kodu
+    progress = pyqtSignal(str) # Anlık ilerleme bilgisi
+
+    def __init__(self, command, process_name):
+        super().__init__()
+        self.command = command
+        self.process_name = process_name
+
+    def run(self):
+        self.progress.emit(f"Komut çalıştırılıyor: {' '.join(self.command)}")
+        try:
+            process = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            
+            # stdout ve stderr'yi anlık olarak oku ve emit et
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    self.progress.emit(output.strip())
+            
+            stderr = process.stderr.read()
+            if stderr:
+                self.progress.emit(f"Hata Çıktısı:\n{stderr}")
+
+            self.finished.emit(f"\n{self.process_name} işlemi tamamlandı. Durum Kodu: {process.returncode}", process.returncode)
+
+        except FileNotFoundError:
+            self.finished.emit(f"Hata: Komut bulunamadı. Lütfen gerekli araçların (örn. ADB) sistem PATH'inde olduğundan emin olun.", 1)
+        except Exception as e:
+            self.finished.emit(f"{self.process_name} sırasında bir hata oluştu: {e}", 1)
+
+
+class MobileDataApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+        self.current_user = None # Giriş yapan kullanıcı
+        self.worker = None # Worker thread örneği
+
+    def initUI(self):
+        self.setWindowTitle(f"{APP_NAME} - {VERSION}")
+        self.setWindowIcon(QIcon('icon.png')) # Uygulama ikonu için 'icon.png' adında bir dosya oluşturabilirsiniz
+        self.setGeometry(100, 100, 1100, 750) # Pencere boyutunu biraz büyüttük
+
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #2c2c2c; /* Koyu arka plan */
+                font-family: 'Segoe UI', sans-serif;
+                color: #e0e0e0; /* Açık renk yazı */
+            }
+            QLabel {
+                color: #e0e0e0; /* Açık renk yazı */
+                font-size: 14px;
+            }
+            QLineEdit, QTextEdit, QComboBox {
+                background-color: #404040; /* Koyu gri input alanları */
+                border: 1px solid #555;
+                border-radius: 5px;
+                padding: 8px;
+                font-size: 14px;
+                color: #e0e0e0; /* Açık renk yazı */
+            }
+            QPushButton {
+                background-color: #007bff; /* Mavi düğme */
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 10px 15px;
+                font-size: 14px;
+                font-weight: bold;
+                outline: none; /* Odaklandığında kenarlık olmasın */
+            }
+            QPushButton:hover {
+                background-color: #0056b3; /* Hover rengi */
+            }
+            QPushButton:pressed {
+                background-color: #003f80; /* Basıldığında rengi */
+            }
+            QPushButton:disabled {
+                background-color: #555555;
+                color: #999999;
+            }
+            QGroupBox {
+                border: 1px solid #555;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding: 10px;
+                background-color: #383838; /* Grubun arka planı */
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                font-size: 16px;
+                font-weight: bold;
+                color: #87ceeb; /* Başlık rengi (açık mavi) */
+            }
+            #headerLabel {
+                font-size: 28px; /* Daha büyük başlık */
+                font-weight: bold;
+                color: #87ceeb; /* Açık mavi başlık */
+                margin-bottom: 25px;
+            }
+            /* Sol menü özelleştirmeleri */
+            #leftMenuWidget {
+                background-color: #1e1e1e; /* Daha koyu sol menü */
+                border-right: 1px solid #444;
+            }
+            #menuTitle {
+                color: #87ceeb;
+                font-size: 18px;
+                font-weight: bold;
+                margin-bottom: 15px;
+            }
+            #leftMenuWidget QPushButton {
+                background-color: #3a3a3a; /* Menü düğme arka planı */
+                color: #e0e0e0; /* Menü düğme yazısı */
+                text-align: left;
+                padding-left: 20px;
+            }
+            #leftMenuWidget QPushButton:hover {
+                background-color: #505050; /* Menü düğme hover */
+            }
+            #leftMenuWidget QPushButton:checked { /* Seçili menü düğmesi */
+                background-color: #007bff;
+                border-left: 5px solid #87ceeb;
+                font-weight: bold;
+            }
+            QTextEdit { /* Log çıktıları için */
+                background-color: #1f1f1f;
+                color: #00ff00; /* Yeşil yazı (konsol stili) */
+                border: 1px solid #555;
+                border-radius: 5px;
+                padding: 5px;
+            }
+        """)
+
+        self.main_layout = QVBoxLayout()
+        self.setLayout(self.main_layout)
+
+        # Sayfalar arası geçiş için StackedWidget
+        self.stacked_widget = QStackedWidget()
+        self.main_layout.addWidget(self.stacked_widget)
+
+        # Giriş Sayfası
+        self.login_page = self.create_login_page()
+        self.stacked_widget.addWidget(self.login_page)
+
+        # Ana Uygulama Sayfası (Giriş yapıldıktan sonra gösterilecek)
+        self.main_app_page = self.create_main_app_page()
+        self.stacked_widget.addWidget(self.main_app_page)
+
+        # Başlangıçta giriş sayfasını göster
+        self.stacked_widget.setCurrentWidget(self.login_page)
+
+    def create_login_page(self):
+        login_widget = QWidget()
+        layout = QVBoxLayout()
+        login_widget.setLayout(layout)
+        layout.setAlignment(Qt.AlignCenter)
+
+        header_label = QLabel("Mobil Veri Asistanı'na Hoş Geldiniz")
+        header_label.setObjectName("headerLabel")
+        header_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header_label)
+
+        form_layout = QFormLayout()
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Kullanıcı Adı")
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Şifre")
+        self.password_input.setEchoMode(QLineEdit.Password)
+
+        # Form elemanlarını merkezi hizala
+        form_layout.addRow(QLabel("Kullanıcı Adı:"), self.username_input)
+        form_layout.addRow(QLabel("Şifre:"), self.password_input)
+        
+        # Form elemanları için hizalamayı iyileştir
+        form_layout.setAlignment(Qt.AlignCenter)
+        form_layout.setContentsMargins(50, 20, 50, 20) # Kenar boşlukları
+
+        login_button = QPushButton("Giriş Yap")
+        login_button.clicked.connect(self.authenticate_user)
+
+        layout.addLayout(form_layout)
+        layout.addWidget(login_button, alignment=Qt.AlignCenter) # Düğmeyi de ortala
+
+        return login_widget
+
+    def authenticate_user(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+
+        if username == ADMIN_USER and password == ADMIN_PASS:
+            self.current_user = "admin"
+            QMessageBox.information(self, "Giriş Başarılı", "Admin olarak giriş yaptınız.")
+            self.stacked_widget.setCurrentWidget(self.main_app_page)
+            self.update_ui_for_admin()
+        else:
+            QMessageBox.warning(self, "Giriş Başarısız", "Yanlış kullanıcı adı veya şifre.")
+            self.current_user = None
+
+    def update_ui_for_admin(self):
+        # Admin paneli sadece admin girişi sonrası aktifleşebilir
+        # Şu an için basitçe, tüm fonksiyonlar admin için açık varsayılıyor.
+        pass
+
+    def create_main_app_page(self):
+        main_widget = QWidget()
+        main_layout = QHBoxLayout()
+        main_widget.setLayout(main_layout)
+
+        # Sol Menü (Navigasyon)
+        left_menu_layout = QVBoxLayout()
+        left_menu_layout.setSpacing(10)
+        left_menu_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Menü Başlığı
+        menu_title = QLabel("İşlemler")
+        menu_title.setObjectName("menuTitle") # Stil için objectName eklendi
+        menu_title.setAlignment(Qt.AlignCenter)
+        left_menu_layout.addWidget(menu_title)
+
+        self.btn_backup = QPushButton("Yedekleme")
+        self.btn_backup.setCheckable(True) # Seçili durumu takip etmek için
+        self.btn_backup.clicked.connect(lambda: self.switch_page("backup"))
+        
+        self.btn_restore = QPushButton("Veri Kurtarma")
+        self.btn_restore.setCheckable(True)
+        self.btn_restore.clicked.connect(lambda: self.switch_page("restore"))
+        
+        self.btn_reset = QPushButton("Telefon Sıfırlama")
+        self.btn_reset.setCheckable(True)
+        self.btn_reset.clicked.connect(lambda: self.switch_page("reset"))
+        
+        self.btn_device_info = QPushButton("Cihaz Bilgisi")
+        self.btn_device_info.setCheckable(True)
+        self.btn_device_info.clicked.connect(lambda: self.switch_page("device_info"))
+        
+        self.btn_admin_panel = QPushButton("Admin Paneli")
+        self.btn_admin_panel.setCheckable(True)
+        self.btn_admin_panel.clicked.connect(lambda: self.switch_page("admin_panel"))
+        
+        self.btn_logout = QPushButton("Çıkış Yap")
+        self.btn_logout.clicked.connect(self.logout_user)
+
+        self.menu_buttons = [self.btn_backup, self.btn_restore, self.btn_reset, self.btn_device_info, self.btn_admin_panel]
+
+        for btn in self.menu_buttons:
+            left_menu_layout.addWidget(btn)
+        
+        left_menu_layout.addStretch(1) # Boşluk bırak
+        left_menu_layout.addWidget(self.btn_logout)
+
+
+        # Sağ İçerik Alanı (Sayfalar)
+        self.content_stacked_widget = QStackedWidget()
+
+        self.backup_page = self.create_backup_page()
+        self.restore_page = self.create_restore_page()
+        self.reset_page = self.create_reset_page()
+        self.device_info_page = self.create_device_info_page()
+        self.admin_panel_page = self.create_admin_panel_page()
+
+        self.content_stacked_widget.addWidget(self.backup_page)
+        self.content_stacked_widget.addWidget(self.restore_page)
+        self.content_stacked_widget.addWidget(self.reset_page)
+        self.content_stacked_widget.addWidget(self.device_info_page)
+        self.content_stacked_widget.addWidget(self.admin_panel_page)
+
+        # Layout'ları ana layout'a ekle
+        left_menu_widget = QWidget()
+        left_menu_widget.setObjectName("leftMenuWidget") # Stil için objectName eklendi
+        left_menu_widget.setLayout(left_menu_layout)
+        left_menu_widget.setFixedWidth(220) # Menü genişliğini biraz artırdık
+
+        main_layout.addWidget(left_menu_widget)
+        main_layout.addWidget(self.content_stacked_widget)
+
+        # Varsayılan olarak Yedekleme sayfasını seçili hale getir
+        self.switch_page("backup")
+
+        return main_widget
+
+    def switch_page(self, page_name):
+        # Tüm menü düğmelerinin "checked" durumunu sıfırla
+        for btn in self.menu_buttons:
+            btn.setChecked(False)
+
+        # Yetkilendirme kontrolü
+        if page_name == "admin_panel" and self.current_user != "admin":
+            QMessageBox.warning(self, "Yetkisiz Erişim", "Bu sayfaya erişim yetkiniz yok.")
+            return
+
+        if page_name == "backup":
+            self.content_stacked_widget.setCurrentWidget(self.backup_page)
+            self.btn_backup.setChecked(True)
+            self.load_devices_for_backup()
+        elif page_name == "restore":
+            self.content_stacked_widget.setCurrentWidget(self.restore_page)
+            self.btn_restore.setChecked(True)
+            self.load_devices_for_restore()
+        elif page_name == "reset":
+            self.content_stacked_widget.setCurrentWidget(self.reset_page)
+            self.btn_reset.setChecked(True)
+            self.load_devices_for_reset()
+        elif page_name == "device_info":
+            self.content_stacked_widget.setCurrentWidget(self.device_info_page)
+            self.btn_device_info.setChecked(True)
+            self.load_devices_for_info()
+        elif page_name == "admin_panel":
+            self.content_stacked_widget.setCurrentWidget(self.admin_panel_page)
+            self.btn_admin_panel.setChecked(True)
+
+    def logout_user(self):
+        reply = QMessageBox.question(self, 'Çıkış Yap', 'Uygulamadan çıkış yapmak istediğinizden emin misiniz?',
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.current_user = None
+            self.username_input.clear()
+            self.password_input.clear()
+            self.stacked_widget.setCurrentWidget(self.login_page)
+
+    # --- Sayfa Oluşturma Metodları ---
+
+    def create_backup_page(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        page.setLayout(layout)
+
+        layout.addWidget(QLabel("<h2>Veri Yedekleme</h2>"))
+
+        device_group = QGroupBox("Cihaz Seçimi")
+        device_layout = QFormLayout()
+        self.backup_brand_combo = QComboBox()
+        self.backup_brand_combo.addItems(PHONE_MODELS.keys())
+        self.backup_brand_combo.currentIndexChanged.connect(self.update_backup_models)
+
+        self.backup_model_combo = QComboBox()
+        self.update_backup_models() # Başlangıçta modelleri doldur
+
+        device_layout.addRow("Marka:", self.backup_brand_combo)
+        device_layout.addRow("Model:", self.backup_model_combo)
+        device_group.setLayout(device_layout)
+        layout.addWidget(device_group)
+
+        action_group = QGroupBox("Yedekleme Ayarları")
+        action_layout = QVBoxLayout()
+        self.backup_type_combo = QComboBox()
+        self.backup_type_combo.addItems(["Tam Yedekleme", "Uygulama Verileri", "Fotoğraflar", "Rehber"])
+        self.backup_location_input = QLineEdit()
+        self.backup_location_input.setPlaceholderText("Yedekleme kaydedilecek konum")
+        self.backup_browse_button = QPushButton("Gözat...")
+        self.backup_browse_button.clicked.connect(self.browse_backup_location) # Dosya seçici eklendi
+
+        action_layout.addWidget(QLabel("Yedekleme Tipi:"))
+        action_layout.addWidget(self.backup_type_combo)
+        action_layout.addWidget(QLabel("Konum:"))
+        action_layout.addWidget(self.backup_location_input)
+        action_layout.addWidget(self.backup_browse_button)
+        action_group.setLayout(action_layout)
+        layout.addWidget(action_group)
+
+        self.start_backup_button = QPushButton("Yedeklemeyi Başlat")
+        self.start_backup_button.clicked.connect(self.start_backup)
+        layout.addWidget(self.start_backup_button)
+
+        self.backup_log_output = QTextEdit()
+        self.backup_log_output.setReadOnly(True)
+        self.backup_log_output.setPlaceholderText("Yedekleme logları burada gösterilecektir...")
+        layout.addWidget(self.backup_log_output)
+
+        layout.addStretch(1)
+        return page
+
+    def update_backup_models(self):
+        selected_brand = self.backup_brand_combo.currentText()
+        self.backup_model_combo.clear()
+        if selected_brand in PHONE_MODELS:
+            self.backup_model_combo.addItems(PHONE_MODELS[selected_brand])
+
+    def load_devices_for_backup(self):
+        self.backup_log_output.clear()
+        self.backup_log_output.append("Cihazlar taranıyor...")
+        self.scan_and_update_device_combos("backup")
+
+    def browse_backup_location(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "Yedekleme Konumu Seç")
+        if folder_path:
+            self.backup_location_input.setText(folder_path)
+
+    def start_backup(self):
+        selected_brand = self.backup_brand_combo.currentText()
+        selected_model = self.backup_model_combo.currentText()
+        backup_type = self.backup_type_combo.currentText()
+        backup_location = self.backup_location_input.text()
+
+        if not backup_location:
+            QMessageBox.warning(self, "Uyarı", "Lütfen yedekleme konumunu belirtin.")
+            return
+        if not os.path.exists(backup_location):
+            QMessageBox.warning(self, "Uyarı", "Belirtilen yedekleme konumu mevcut değil.")
+            return
+
+        self.backup_log_output.clear()
+        self.backup_log_output.append(f"[{selected_brand} {selected_model}] için '{backup_type}' yedeklemesi başlatılıyor...")
+        self.backup_log_output.append(f"Konum: {backup_location}")
+        self.backup_log_output.append("---")
+
+        if selected_brand in ["Samsung", "Xiaomi"] and selected_model != "Mevcut Cihazları Algıla": # Android cihazlar
+            backup_file_name = f"{selected_brand}_{selected_model}_{backup_type.replace(' ', '_')}_backup.ab"
+            full_path = os.path.join(backup_location, backup_file_name)
+            
+            # Gerçek bir ADB yedekleme komutu örneği (rooted olmayan cihazlarda uygulama verisi kısıtlı olabilir)
+            # adb backup -all -f "C:\path\to\mybackup.ab"
+            # veya sadece paylaşılan depolama (SD kart) yedeklemesi: adb backup -shared -f "C:\path\to\mybackup.ab"
+            
+            # Bu sadece bir simülasyon komutudur. Gerçek bir yedekleme için daha karmaşık ADB seçenekleri veya 
+            # özel kütüphaneler/API'ler gerekebilir.
+            command = ['adb', 'shell', 'echo', f'Yedekleme simülasyonu: {backup_type} {full_path} adresine kaydediliyor.']
+            
+            self.start_worker_process(command, "Yedekleme", self.backup_log_output)
+        else:
+            self.backup_log_output.append(f"{selected_brand} {selected_model} için doğrudan yedekleme desteği henüz mevcut değil veya sadece simülasyon.")
+            QMessageBox.information(self, "Bilgi", "Bu marka/model için doğrudan yedekleme desteği sınırlıdır veya 'Mevcut Cihazları Algıla' seçeneği seçilmelidir.")
+
+
+    def create_restore_page(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        page.setLayout(layout)
+
+        layout.addWidget(QLabel("<h2>Veri Kurtarma</h2>"))
+
+        device_group = QGroupBox("Cihaz Seçimi")
+        device_layout = QFormLayout()
+        self.restore_brand_combo = QComboBox()
+        self.restore_brand_combo.addItems(PHONE_MODELS.keys())
+        self.restore_brand_combo.currentIndexChanged.connect(self.update_restore_models)
+        self.restore_model_combo = QComboBox()
+        self.update_restore_models()
+        device_layout.addRow("Marka:", self.restore_brand_combo)
+        device_layout.addRow("Model:", self.restore_model_combo)
+        device_group.setLayout(device_layout)
+        layout.addWidget(device_group)
+
+        action_group = QGroupBox("Kurtarma Ayarları")
+        action_layout = QVBoxLayout()
+        self.restore_file_input = QLineEdit()
+        self.restore_file_input.setPlaceholderText("Kurtarılacak yedekleme dosyası")
+        self.restore_browse_button = QPushButton("Gözat...")
+        self.restore_browse_button.clicked.connect(self.browse_restore_file)
+
+        action_layout.addWidget(QLabel("Yedekleme Dosyası:"))
+        action_layout.addWidget(self.restore_file_input)
+        action_layout.addWidget(self.restore_browse_button)
+        action_group.setLayout(action_layout)
+        layout.addWidget(action_group)
+
+        self.start_restore_button = QPushButton("Kurtarmayı Başlat")
+        self.start_restore_button.clicked.connect(self.start_restore)
+        layout.addWidget(self.start_restore_button)
+
+        self.restore_log_output = QTextEdit()
+        self.restore_log_output.setReadOnly(True)
+        self.restore_log_output.setPlaceholderText("Veri kurtarma logları burada gösterilecektir...")
+        layout.addWidget(self.restore_log_output)
+
+        layout.addStretch(1)
+        return page
+
+    def update_restore_models(self):
+        selected_brand = self.restore_brand_combo.currentText()
+        self.restore_model_combo.clear()
+        if selected_brand in PHONE_MODELS:
+            self.restore_model_combo.addItems(PHONE_MODELS[selected_brand])
+
+    def load_devices_for_restore(self):
+        self.restore_log_output.clear()
+        self.restore_log_output.append("Cihazlar taranıyor... (Kurtarma)")
+        self.scan_and_update_device_combos("restore")
+
+    def browse_restore_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Yedekleme Dosyası Seç", "", "Yedekleme Dosyaları (*.ab);;Tüm Dosyalar (*)")
+        if file_path:
+            self.restore_file_input.setText(file_path)
+
+    def start_restore(self):
+        selected_brand = self.restore_brand_combo.currentText()
+        selected_model = self.restore_model_combo.currentText()
+        restore_file = self.restore_file_input.text()
+
+        if not restore_file:
+            QMessageBox.warning(self, "Uyarı", "Lütfen kurtarılacak yedekleme dosyasını belirtin.")
+            return
+        if not os.path.exists(restore_file):
+            self.restore_log_output.append(f"Hata: Belirtilen dosya bulunamadı: {restore_file}")
+            QMessageBox.warning(self, "Hata", "Belirtilen yedekleme dosyası bulunamadı.")
+            return
+
+        self.restore_log_output.clear()
+        self.restore_log_output.append(f"[{selected_brand} {selected_model}] cihazına '{restore_file}' dosyasından veri kurtarma başlatılıyor...")
+        self.restore_log_output.append("---")
+
+        if selected_brand in ["Samsung", "Xiaomi"] and selected_model != "Mevcut Cihazları Algıla": # Android cihazlar
+            # adb restore <path/to/backup.ab>
+            command = ['adb', 'shell', 'echo', f'Veri kurtarma simülasyonu: {restore_file} dosyasından.']
+            self.start_worker_process(command, "Veri Kurtarma", self.restore_log_output)
+        else:
+            self.restore_log_output.append(f"{selected_brand} {selected_model} için doğrudan veri kurtarma desteği henüz mevcut değil veya sadece simülasyon.")
+            QMessageBox.information(self, "Bilgi", "Bu marka/model için doğrudan veri kurtarma desteği sınırlıdır veya 'Mevcut Cihazları Algıla' seçeneği seçilmelidir.")
+
+
+    def create_reset_page(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        page.setLayout(layout)
+
+        layout.addWidget(QLabel("<h2>Telefon Sıfırlama</h2>"))
+
+        device_group = QGroupBox("Cihaz Seçimi")
+        device_layout = QFormLayout()
+        self.reset_brand_combo = QComboBox()
+        self.reset_brand_combo.addItems(PHONE_MODELS.keys())
+        self.reset_brand_combo.currentIndexChanged.connect(self.update_reset_models)
+        self.reset_model_combo = QComboBox()
+        self.update_reset_models()
+        device_layout.addRow("Marka:", self.reset_brand_combo)
+        device_layout.addRow("Model:", self.reset_model_combo)
+        device_group.setLayout(device_layout)
+        layout.addWidget(device_group)
+
+        action_group = QGroupBox("Sıfırlama Tipi")
+        action_layout = QVBoxLayout()
+        self.reset_type_combo = QComboBox()
+        self.reset_type_combo.addItems(["Normal Sıfırlama (Fabrika Ayarları)", "Hard Reset (Kurtarma Modu)"])
+        action_layout.addWidget(self.reset_type_combo)
+        action_group.setLayout(action_layout)
+        layout.addWidget(action_group)
+
+        self.start_reset_button = QPushButton("Sıfırlamayı Başlat")
+        self.start_reset_button.clicked.connect(self.start_reset)
+        layout.addWidget(self.start_reset_button)
+
+        self.reset_log_output = QTextEdit()
+        self.reset_log_output.setReadOnly(True)
+        self.reset_log_output.setPlaceholderText("Sıfırlama logları burada gösterilecektir...")
+        layout.addWidget(self.reset_log_output)
+
+        layout.addStretch(1)
+        return page
+
+    def update_reset_models(self):
+        selected_brand = self.reset_brand_combo.currentText()
+        self.reset_model_combo.clear()
+        if selected_brand in PHONE_MODELS:
+            self.reset_model_combo.addItems(PHONE_MODELS[selected_brand])
+
+    def load_devices_for_reset(self):
+        self.reset_log_output.clear()
+        self.reset_log_output.append("Cihazlar taranıyor... (Sıfırlama)")
+        self.scan_and_update_device_combos("reset")
+
+    def start_reset(self):
+        selected_brand = self.reset_brand_combo.currentText()
+        selected_model = self.reset_model_combo.currentText()
+        reset_type = self.reset_type_combo.currentText()
+
+        confirm_text = f"Dikkat! [{selected_brand} {selected_model}] cihazını '{reset_type}' yapmak üzeresiniz. Bu işlem tüm verileri silebilir. Emin misiniz?"
+        reply = QMessageBox.question(self, 'Onay', confirm_text,
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            self.reset_log_output.append("Sıfırlama işlemi iptal edildi.")
+            return
+
+        self.reset_log_output.clear()
+        self.reset_log_output.append(f"[{selected_brand} {selected_model}] cihazı için '{reset_type}' başlatılıyor...")
+        self.reset_log_output.append("---")
+
+        if selected_brand in ["Samsung", "Xiaomi"] and selected_model != "Mevcut Cihazları Algıla": # Android cihazlar
+            if "Normal Sıfırlama" in reset_type:
+                # Fabrika ayarlarına sıfırlama komutu (cihazın açılması ve adb yetkisi gerektirir)
+                command = ['adb', 'shell', 'am', 'broadcast', '-a', 'android.intent.action.MASTER_CLEAR']
+                self.reset_log_output.append("Cihazın fabrika ayarlarına sıfırlanması için ek onay vermeniz gerekebilir.")
+            elif "Hard Reset" in reset_type:
+                # Cihazı kurtarma moduna alma (ADB root yetkisi veya bootloader kilidinin açık olması gerekebilir)
+                command = ['adb', 'reboot', 'recovery']
+                self.reset_log_output.append("Cihaz kurtarma moduna yeniden başlatılıyor. Manuel olarak hard reset yapmanız gerekebilir.")
+            else:
+                self.reset_log_output.append("Geçersiz sıfırlama tipi.")
+                return
+
+            self.start_worker_process(command, "Telefon Sıfırlama", self.reset_log_output)
+        else:
+            self.reset_log_output.append(f"{selected_brand} {selected_model} için doğrudan sıfırlama desteği henüz mevcut değil veya sadece simülasyon.")
+            QMessageBox.information(self, "Bilgi", "Bu marka/model için doğrudan sıfırlama desteği sınırlıdır veya 'Mevcut Cihazları Algıla' seçeneği seçilmelidir.")
+
+
+    def create_device_info_page(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        page.setLayout(layout)
+
+        layout.addWidget(QLabel("<h2>Cihaz Bilgisi</h2>"))
+
+        info_group = QGroupBox("Bağlı Cihazlar")
+        info_layout = QVBoxLayout()
+        self.detected_devices_list = QTextEdit()
+        self.detected_devices_list.setReadOnly(True)
+        self.detected_devices_list.setPlaceholderText("Bağlı cihazlar burada listelenecektir...")
+
+        self.refresh_devices_button = QPushButton("Cihazları Yenile")
+        self.refresh_devices_button.clicked.connect(self.load_devices_for_info)
+
+        info_layout.addWidget(self.detected_devices_list)
+        info_layout.addWidget(self.refresh_devices_button)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch(1)
+        return page
+
+    def load_devices_for_info(self):
+        self.detected_devices_list.clear()
+        self.detected_devices_list.append("Bağlı cihazlar taranıyor...")
+        self.scan_and_update_device_combos("info") # Tüm cihaz bilgilerini yükle
+
+    def scan_and_update_device_combos(self, page_type):
+        """ADB ile bağlı cihazları tarar ve ilgili ComboBox'ları günceller."""
+        try:
+            result = subprocess.run(['adb', 'devices', '-l'], capture_output=True, text=True, check=True)
+            output_lines = result.stdout.splitlines()
+            
+            detected_serials = []
+            device_details = []
+            
+            if len(output_lines) > 1:
+                # İlk satır genellikle "List of devices attached" olduğu için atlanabilir
+                for line in output_lines[1:]:
+                    if '\tdevice' in line and line.strip():
+                        parts = line.split()
+                        serial = parts[0]
+                        detected_serials.append(serial)
+                        # Daha detaylı bilgi ayrıştırma (örnek)
+                        model = "Bilinmiyor"
+                        product = "Bilinmiyor"
+                        for part in parts:
+                            if part.startswith("model:"):
+                                model = part.replace("model:", "")
+                            elif part.startswith("product:"):
+                                product = part.replace("product:", "")
+                        device_details.append(f"Seri: {serial}, Model: {model}, Ürün: {product}")
+
+            if detected_serials:
+                if page_type == "backup":
+                    self.backup_model_combo.clear()
+                    self.backup_model_combo.addItem("Mevcut Cihazları Algıla")
+                    self.backup_model_combo.addItems(detected_serials)
+                elif page_type == "restore":
+                    self.restore_model_combo.clear()
+                    self.restore_model_combo.addItem("Mevcut Cihazları Algıla")
+                    self.restore_model_combo.addItems(detected_serials)
+                elif page_type == "reset":
+                    self.reset_model_combo.clear()
+                    self.reset_model_combo.addItem("Mevcut Cihazları Algıla")
+                    self.reset_model_combo.addItems(detected_serials)
+                
+                if page_type == "info":
+                    self.detected_devices_list.clear()
+                    self.detected_devices_list.append("--- Tespit Edilen Bağlı Android Cihazlar ---")
+                    for detail in device_details:
+                        self.detected_devices_list.append(detail)
+                    self.detected_devices_list.append("----------------------------")
+                else:
+                    self.get_log_output_widget(page_type).append(f"Bağlı Android Cihazlar Algılandı: {', '.join(detected_serials)}")
+            else:
+                if page_type == "backup":
+                    self.backup_model_combo.clear()
+                    self.backup_model_combo.addItem("Mevcut Cihazları Algıla")
+                    self.update_backup_models() # Geleneksel modelleri tekrar ekle
+                elif page_type == "restore":
+                    self.restore_model_combo.clear()
+                    self.restore_model_combo.addItem("Mevcut Cihazları Algıla")
+                    self.update_restore_models()
+                elif page_type == "reset":
+                    self.reset_model_combo.clear()
+                    self.reset_model_combo.addItem("Mevcut Cihazları Algıla")
+                    self.update_reset_models()
+
+                if page_type == "info":
+                    self.detected_devices_list.clear()
+                    self.detected_devices_list.append("Bağlı Android cihaz bulunamadı. Lütfen USB hata ayıklamanın açık olduğundan ve cihazın bağlı olduğundan emin olun.")
+                else:
+                    self.get_log_output_widget(page_type).append("Bağlı Android cihaz bulunamadı. ADB kurulu ve PATH'te mi?")
+            
+        except FileNotFoundError:
+            if page_type == "info":
+                self.detected_devices_list.append("Hata: ADB (Android Debug Bridge) bulunamadı. Lütfen kurun ve PATH'e ekleyin.")
+            else:
+                self.get_log_output_widget(page_type).append("Hata: ADB (Android Debug Bridge) bulunamadı. Lütfen kurun.")
+        except subprocess.CalledProcessError as e:
+            if page_type == "info":
+                self.detected_devices_list.append(f"ADB hatası: {e.stderr}")
+            else:
+                self.get_log_output_widget(page_type).append(f"ADB hatası: {e.stderr}")
+        except Exception as e:
+            if page_type == "info":
+                self.detected_devices_list.append(f"Cihaz tarama hatası: {e}")
+            else:
+                self.get_log_output_widget(page_type).append(f"Cihaz tarama hatası: {e}")
+
+    def get_log_output_widget(self, page_type):
+        """İlgili sayfanın log çıktı widget'ını döndürür."""
+        if page_type == "backup":
+            return self.backup_log_output
+        elif page_type == "restore":
+            return self.restore_log_output
+        elif page_type == "reset":
+            return self.reset_log_output
+        elif page_type == "info":
+            return self.detected_devices_list
+        return None # Hata durumu
+
+    def start_worker_process(self, command, process_name, log_widget):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "İşlem Devam Ediyor", "Başka bir işlem zaten çalışıyor. Lütfen bekleyin.")
+            return
+
+        self.worker = Worker(command, process_name)
+        self.worker.progress.connect(log_widget.append)
+        self.worker.finished.connect(lambda msg, code: self.process_finished(msg, code, log_widget, process_name))
+        self.worker.start()
+
+    def process_finished(self, msg, code, log_widget, process_name):
+        log_widget.append(msg)
+        if code == 0:
+            QMessageBox.information(self, "Başarılı", f"{process_name} işlemi başarıyla tamamlandı (simülasyon).")
+        else:
+            QMessageBox.warning(self, "Hata", f"{process_name} işlemi başarısız oldu (simülasyon).")
+        self.worker = None # Worker nesnesini temizle
+
+    def create_admin_panel_page(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        page.setLayout(layout)
+
+        layout.addWidget(QLabel("<h2>Admin Paneli</h2>"))
+
+        # Kullanıcı Yönetimi
+        user_group = QGroupBox("Kullanıcı Yönetimi")
+        user_layout = QFormLayout()
+        self.new_username_input = QLineEdit()
+        self.new_password_input = QLineEdit()
+        self.new_password_input.setEchoMode(QLineEdit.Password)
+        self.add_user_button = QPushButton("Kullanıcı Ekle (Şu an pasif)")
+        self.add_user_button.setDisabled(True) # Bu kısım için gerçek veritabanı gerekir
+
+        user_layout.addRow("Yeni Kullanıcı Adı:", self.new_username_input)
+        user_layout.addRow("Yeni Şifre:", self.new_password_input)
+        user_layout.addWidget(self.add_user_button)
+        user_group.setLayout(user_layout)
+        layout.addWidget(user_group)
+
+        # Logları Görüntüleme (Basit bir örnek)
+        log_group = QGroupBox("Uygulama Logları")
+        log_layout = QVBoxLayout()
+        self.app_logs_display = QTextEdit()
+        self.app_logs_display.setReadOnly(True)
+        self.app_logs_display.setPlaceholderText("Uygulama içi loglar ve hatalar burada görüntülenecektir...")
+        
+        self.load_logs_button = QPushButton("Logları Yükle (Simülasyon)")
+        self.load_logs_button.clicked.connect(self.load_simulated_logs)
+
+        log_layout.addWidget(self.app_logs_display)
+        log_layout.addWidget(self.load_logs_button)
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+
+        layout.addStretch(1)
+        return page
+
+    def load_simulated_logs(self):
+        self.app_logs_display.clear()
+        self.app_logs_display.append("Simüle edilmiş loglar yükleniyor...")
+        self.app_logs_display.append("---")
+        self.app_logs_display.append("[2025-06-20 21:00:01] INFO: Uygulama başlatıldı.")
+        self.app_logs_display.append("[2025-06-20 21:00:15] USER: admin giriş yaptı.")
+        self.app_logs_display.append("[2025-06-20 21:01:30] ACTION: Samsung Galaxy S23 için tam yedekleme başlatıldı.")
+        self.app_logs_display.append("[2025-06-20 21:02:45] WARNING: ADB bağlantı hatası oluştu.")
+        self.app_logs_display.append("[2025-06-20 21:03:10] ACTION: Xiaomi Redmi Note 12 sıfırlama talebi.")
+        self.app_logs_display.append("[2025-06-20 21:03:15] ERROR: Sıfırlama komutu başarısız oldu.")
+        self.app_logs_display.append("[2025-06-20 21:04:00] INFO: Cihaz bilgisi sorgusu yapıldı.")
+        self.app_logs_display.append("---")
+        self.app_logs_display.append("Loglar güncel bir veritabanından veya dosyadan okunabilir.")
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    ex = MobileDataApp()
+    ex.show()
+    sys.exit(app.exec_())
+
